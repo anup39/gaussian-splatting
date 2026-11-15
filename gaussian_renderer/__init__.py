@@ -14,8 +14,11 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.geoconstraint import scale_gradient
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0,
+           separate_sh = False, override_color = None, use_trained_exp=False,
+           geometry_gradient_scale=1.0):
     """
     Render the scene. 
     
@@ -51,9 +54,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = scale_gradient(pc.get_xyz, geometry_gradient_scale)
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = scale_gradient(pc.get_opacity, geometry_gradient_scale)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -62,13 +65,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     cov3D_precomp = None
 
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = scale_gradient(pc.get_covariance(scaling_modifier), geometry_gradient_scale)
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        scales = scale_gradient(pc.get_scaling, geometry_gradient_scale)
+        rotations = scale_gradient(pc.get_rotation, geometry_gradient_scale)
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    dc = None
     shs = None
     colors_precomp = None
     if override_color is None:
@@ -126,3 +130,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         }
     
     return out
+
+
+def render_semantics(viewpoint_camera, pc: GaussianModel, pipe,
+                     geometry_gradient_scale=1.0, minimum_coverage=1e-6):
+    """Render per-Gaussian GIS membership, accumulated opacity, and inverse depth.
+
+    Channel zero contains the alpha-composited membership numerator and channel
+    one contains accumulated opacity because every Gaussian is rendered with a
+    unit value in that channel. Their ratio is an opacity-normalized semantic
+    probability. The rasterizer's inverse-depth output is normalized by the same
+    accumulated opacity.
+    """
+    membership = pc.get_feature_membership
+    semantic_colours = torch.cat(
+        (membership, torch.ones_like(membership), torch.zeros_like(membership)), dim=1
+    )
+    package = render(
+        viewpoint_camera,
+        pc,
+        pipe,
+        torch.zeros(3, dtype=membership.dtype, device=membership.device),
+        override_color=semantic_colours,
+        geometry_gradient_scale=geometry_gradient_scale,
+    )
+    numerator = package["render"][0:1]
+    coverage = package["render"][1:2].clamp(0.0, 1.0)
+    denominator = coverage.clamp_min(float(minimum_coverage))
+    package["semantic_numerator"] = numerator
+    package["coverage"] = coverage
+    package["semantic_probability"] = (numerator / denominator).clamp(0.0, 1.0)
+    package["normalized_invdepth"] = package["depth"] / denominator
+    return package

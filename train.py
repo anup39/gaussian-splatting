@@ -10,10 +10,18 @@
 #
 
 import os
+import json
+import numpy as np
 import torch
-from random import randint
+from random import choice, randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from utils.geoconstraint import (
+    boundary_confidence,
+    depth_aware_cross_view_loss,
+    ramped_weight,
+    weighted_dice_bce_loss,
+)
+from gaussian_renderer import render, render_semantics, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -40,15 +48,93 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
+def build_camera_neighbors(cameras, neighbor_count):
+    """Return nearest camera candidates for overlapping-view sampling."""
+    if len(cameras) < 2:
+        return {}
+    centers = np.stack([camera.camera_center.detach().cpu().numpy() for camera in cameras])
+    squared_distances = ((centers[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+    np.fill_diagonal(squared_distances, np.inf)
+    count = min(max(int(neighbor_count), 1), len(cameras) - 1)
+    return {
+        id(camera): [cameras[index] for index in np.argsort(squared_distances[row])[:count]]
+        for row, camera in enumerate(cameras)
+    }
+
+
+def validate_geospatial_options(opt):
+    nonnegative = {
+        "geo_mask_weight": opt.geo_mask_weight,
+        "geo_boundary_weight": opt.geo_boundary_weight,
+        "geo_densify_weight": opt.geo_densify_weight,
+        "geo_cross_view_weight": opt.geo_cross_view_weight,
+        "geo_start_iteration": opt.geo_start_iteration,
+        "geo_ramp_iterations": opt.geo_ramp_iterations,
+        "geo_cross_view_min_pixels": opt.geo_cross_view_min_pixels,
+        "geo_boundary_ignore_px": opt.geo_boundary_ignore_px,
+        "geo_boundary_band_px": opt.geo_boundary_band_px,
+        "geo_cross_view_interval": opt.geo_cross_view_interval,
+    }
+    for name, value in nonnegative.items():
+        if value < 0:
+            raise ValueError("--{} must be non-negative".format(name))
+    for name, value in {
+        "geo_geometry_gradient_scale": opt.geo_geometry_gradient_scale,
+        "geo_boundary_min_weight": opt.geo_boundary_min_weight,
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("--{} must be in [0, 1]".format(name))
+    if not 0.0 < opt.geo_cross_view_downsample <= 1.0:
+        raise ValueError("--geo_cross_view_downsample must be in (0, 1]")
+    if not 0.0 < opt.geo_min_coverage <= 1.0:
+        raise ValueError("--geo_min_coverage must be in (0, 1]")
+    if opt.geo_cross_view_depth_tolerance <= 0:
+        raise ValueError("--geo_cross_view_depth_tolerance must be positive")
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
+    validate_geospatial_options(opt)
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, opt, pipe)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
+    train_cameras = scene.getTrainCameras()
+    masked_train_cameras = [camera for camera in train_cameras if camera.gis_mask is not None]
+    gis_requested = (
+        opt.geo_mask_weight > 0
+        or opt.geo_boundary_weight > 0
+        or opt.geo_cross_view_weight > 0
+        or opt.geo_depth_inside_mask
+    )
+    if gis_requested:
+        if not masked_train_cameras:
+            raise RuntimeError(
+                "GIS supervision was requested, but no training masks were loaded. "
+                "Check --gis_mask_dir and image-stem filenames."
+            )
+        missing_count = len(train_cameras) - len(masked_train_cameras)
+        if missing_count and not opt.geo_allow_missing_masks:
+            raise RuntimeError(
+                f"GIS supervision requested but {missing_count}/{len(train_cameras)} training masks are missing. "
+                "Fix the dataset or pass --geo_allow_missing_masks to continue intentionally."
+            )
+        print(f"GIS masks loaded for {len(masked_train_cameras)}/{len(train_cameras)} training cameras")
+
+    positive_mask_cameras = [
+        camera for camera in masked_train_cameras if float(camera.gis_mask.sum()) > 0
+    ]
+    camera_neighbors = build_camera_neighbors(positive_mask_cameras, opt.geo_cross_view_neighbors)
+    if opt.geo_cross_view_weight > 0 and not camera_neighbors:
+        raise RuntimeError(
+            "Cross-view supervision requires at least two training cameras with non-empty GIS masks"
+        )
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -67,6 +153,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_geo_loss_for_log = 0.0
+    ema_cross_view_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -125,14 +213,106 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        # GeoConstraintGS.  The existing rasterizer is reused: a second pass
+        # splats each Gaussian's learnable feature probability as a grey value.
+        # This keeps the method Python/PyTorch-only while retaining gradients.
+        geo_mask_loss = torch.zeros((), device="cuda")
+        geo_boundary_loss = torch.zeros((), device="cuda")
+        cross_view_loss = torch.zeros((), device="cuda")
+        cross_view_stats = None
+        effective_geo_weight = ramped_weight(
+            opt.geo_mask_weight, iteration, opt.geo_start_iteration, opt.geo_ramp_iterations
+        )
+        effective_cross_view_weight = ramped_weight(
+            opt.geo_cross_view_weight, iteration, opt.geo_start_iteration, opt.geo_ramp_iterations
+        )
+        semantic_pkg = None
+        semantic_requested = effective_geo_weight > 0 or opt.geo_boundary_weight > 0 or effective_cross_view_weight > 0
+        if viewpoint_cam.gis_mask is not None and semantic_requested:
+            semantic_pkg = render_semantics(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                geometry_gradient_scale=opt.geo_geometry_gradient_scale,
+                minimum_coverage=opt.geo_min_coverage,
+            )
+            rendered_mask = (
+                semantic_pkg["semantic_probability"]
+                if opt.geo_normalize_semantic else semantic_pkg["semantic_numerator"]
+            )
+            target_mask = viewpoint_cam.gis_mask
+            confidence = boundary_confidence(
+                target_mask, opt.geo_boundary_ignore_px, opt.geo_boundary_min_weight
+            )
+            if opt.geo_normalize_semantic:
+                confidence = confidence * (semantic_pkg["coverage"].detach() >= opt.geo_min_coverage)
+            if effective_geo_weight > 0:
+                geo_mask_loss = weighted_dice_bce_loss(rendered_mask, target_mask, confidence)
+                loss += effective_geo_weight * geo_mask_loss
+            if opt.geo_boundary_weight > 0:
+                boundary_only = 1.0 - boundary_confidence(
+                    target_mask, int(opt.geo_boundary_band_px), 0.0
+                )
+                geo_boundary_loss = (
+                    boundary_only * (rendered_mask - target_mask).abs()
+                ).sum() / boundary_only.sum().clamp_min(1.0)
+                loss += opt.geo_boundary_weight * geo_boundary_loss
+
+            if (
+                effective_cross_view_weight > 0
+                and iteration % max(opt.geo_cross_view_interval, 1) == 0
+                and id(viewpoint_cam) in camera_neighbors
+            ):
+                paired_camera = choice(camera_neighbors[id(viewpoint_cam)])
+                paired_pkg = render_semantics(
+                    paired_camera,
+                    gaussians,
+                    pipe,
+                    geometry_gradient_scale=opt.geo_geometry_gradient_scale,
+                    minimum_coverage=opt.geo_min_coverage,
+                )
+                cross_view_loss, cross_view_stats = depth_aware_cross_view_loss(
+                    semantic_pkg["semantic_probability"],
+                    semantic_pkg["normalized_invdepth"],
+                    semantic_pkg["coverage"],
+                    paired_pkg["semantic_probability"],
+                    paired_pkg["normalized_invdepth"],
+                    paired_pkg["coverage"],
+                    viewpoint_cam,
+                    paired_camera,
+                    source_region=target_mask,
+                    source_confidence=confidence,
+                    downsample=opt.geo_cross_view_downsample,
+                    minimum_coverage=opt.geo_min_coverage,
+                    relative_depth_tolerance=opt.geo_cross_view_depth_tolerance,
+                    minimum_valid_pixels=opt.geo_cross_view_min_pixels,
+                )
+                loss += effective_cross_view_weight * cross_view_loss
+
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+            depth_mask = viewpoint_cam.depth_mask.cuda() * (mono_invdepth > 0)
+            depth_residual = torch.abs(invDepth - mono_invdepth)
+            if opt.geo_depth_charbonnier_epsilon > 0:
+                depth_residual = torch.sqrt(
+                    depth_residual.square() + opt.geo_depth_charbonnier_epsilon**2
+                )
+            if opt.geo_depth_inside_mask:
+                if viewpoint_cam.gis_mask is None:
+                    depth_mask = torch.zeros_like(depth_mask)
+                else:
+                    depth_confidence = boundary_confidence(
+                        viewpoint_cam.gis_mask,
+                        opt.geo_boundary_ignore_px,
+                        opt.geo_boundary_min_weight,
+                    )
+                    depth_mask = depth_mask * viewpoint_cam.gis_mask * depth_confidence
+                Ll1depth_pure = (depth_residual * depth_mask).sum() / depth_mask.sum().clamp_min(1.0)
+            else:
+                Ll1depth_pure = (depth_residual * depth_mask).mean()
             Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
@@ -147,15 +327,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_geo_loss_for_log = 0.4 * float(geo_mask_loss.detach()) + 0.6 * ema_geo_loss_for_log
+            ema_cross_view_loss_for_log = 0.4 * float(cross_view_loss.detach()) + 0.6 * ema_cross_view_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.7f}",
+                    "Depth": f"{ema_Ll1depth_for_log:.7f}",
+                    "GIS": f"{ema_geo_loss_for_log:.7f}",
+                    "CrossView": f"{ema_cross_view_loss_for_log:.7f}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            loss_terms = {
+                "gis_unweighted": float(geo_mask_loss.detach()),
+                "gis_effective_weight": effective_geo_weight,
+                "boundary_unweighted": float(geo_boundary_loss.detach()),
+                "cross_view_unweighted": float(cross_view_loss.detach()),
+                "cross_view_effective_weight": effective_cross_view_weight,
+            }
+            if cross_view_stats is not None:
+                loss_terms.update({
+                    f"cross_view_{key}": float(value)
+                    for key, value in cross_view_stats.items()
+                })
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, loss_terms)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -168,7 +367,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii,
+                                                geo_densify_weight=opt.geo_densify_weight)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -189,7 +389,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args, optimization_args=None, pipeline_args=None):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -202,6 +402,13 @@ def prepare_output_and_logger(args):
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
+    experiment_config = {"model": vars(args)}
+    if optimization_args is not None:
+        experiment_config["optimization"] = vars(optimization_args)
+    if pipeline_args is not None:
+        experiment_config["pipeline"] = vars(pipeline_args)
+    with open(os.path.join(args.model_path, "experiment_config.json"), "w") as config_file:
+        json.dump(experiment_config, config_file, indent=2, default=str)
 
     # Create Tensorboard writer
     tb_writer = None
@@ -211,11 +418,13 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, loss_terms=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        for name, value in (loss_terms or {}).items():
+            tb_writer.add_scalar(f"train_loss_patches/{name}", value, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -273,7 +482,7 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    safe_state(args.quiet, args.seed)
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
