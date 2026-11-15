@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+
 import torch
 from torch import nn
 import numpy as np
@@ -20,7 +22,8 @@ class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, is_test_view = False,
+                 gis_mask_path=""
                  ):
         super(Camera, self).__init__()
 
@@ -57,6 +60,15 @@ class Camera(nn.Module):
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+
+        if not is_test_dataset and gis_mask_path and os.path.isfile(gis_mask_path):
+            mask = cv2.imread(gis_mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Unable to read GIS mask at '{gis_mask_path}'")
+            mask = cv2.resize(mask, resolution, interpolation=cv2.INTER_NEAREST)
+            self.gis_mask = torch.from_numpy(mask[None] > 127).to(
+                device=self.data_device, dtype=torch.float32
+            )
 
         self.invdepthmap = None
         self.depth_reliable = False
