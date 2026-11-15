@@ -55,6 +55,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
+        self.gis_mask_dir = ""
+        self.eval_split_file = ""
+        self.seed = 0
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -97,6 +100,29 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # GeoConstraintGS: use zero to reproduce the original 3DGS objective.
+        self.geo_mask_weight = 0.0
+        self.geo_boundary_weight = 0.0
+        self.geo_densify_weight = 0.0
+        self.geo_boundary_band_px = 8.0
+        # GeoSemAlign-GS options. Defaults preserve the original GeoConstraintGS
+        # behavior; enable them explicitly for controlled experiments.
+        self.geo_normalize_semantic = False
+        self.geo_start_iteration = 0
+        self.geo_ramp_iterations = 0
+        self.geo_geometry_gradient_scale = 1.0
+        self.geo_boundary_ignore_px = 0
+        self.geo_boundary_min_weight = 0.0
+        self.geo_min_coverage = 0.01
+        self.geo_allow_missing_masks = False
+        self.geo_depth_inside_mask = False
+        self.geo_depth_charbonnier_epsilon = 0.0
+        self.geo_cross_view_weight = 0.0
+        self.geo_cross_view_downsample = 0.25
+        self.geo_cross_view_depth_tolerance = 0.05
+        self.geo_cross_view_min_pixels = 128
+        self.geo_cross_view_neighbors = 4
+        self.geo_cross_view_interval = 1
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

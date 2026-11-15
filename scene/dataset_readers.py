@@ -36,6 +36,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    gis_mask_path: str = ""
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -68,7 +69,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list, gis_mask_dir=""):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -108,10 +109,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        gis_mask_path = os.path.join(gis_mask_dir, os.path.splitext(extr.name)[0] + ".png") if gis_mask_dir else ""
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              gis_mask_path=gis_mask_path)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -142,7 +145,8 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
+                        gis_mask_dir="", eval_split_file=""):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -177,14 +181,28 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             sys.exit(1)
 
     if eval:
-        if "360" in path:
+        if eval_split_file:
+            split_path = eval_split_file if os.path.isabs(eval_split_file) else os.path.join(path, eval_split_file)
+            with open(split_path, "r") as file:
+                test_cam_names_list = [
+                    line.strip() for line in file if line.strip() and not line.lstrip().startswith("#")
+                ]
+            available_names = {cam_extrinsics[cam_id].name for cam_id in cam_extrinsics}
+            unknown_names = sorted(set(test_cam_names_list) - available_names)
+            if unknown_names:
+                preview = ", ".join(unknown_names[:5])
+                raise ValueError(f"Evaluation split contains {len(unknown_names)} unknown image names: {preview}")
+            if not test_cam_names_list:
+                raise ValueError(f"Evaluation split is empty: {split_path}")
+            print(f"------------EXPLICIT HOLDOUT: {len(test_cam_names_list)} IMAGES-------------")
+        elif "360" in path:
             llffhold = 8
-        if llffhold:
+        if not eval_split_file and llffhold:
             print("------------LLFF HOLD-------------")
             cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
             cam_names = sorted(cam_names)
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
-        else:
+        elif not eval_split_file:
             with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
@@ -194,7 +212,8 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list,
+        gis_mask_dir=gis_mask_dir)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
