@@ -12,7 +12,7 @@ git clone git@github.com:anup39/gis-gaussian-splatting.git --recursive
 or
 ```shell
 # HTTPS
-git clone https://github.com/anup39/gis-gaussian-splatting --recursive
+git clone git@github.com:anup39/gis-gaussian-splatting.git --recursive
 ```
 
 ### Download and Install Miniconda, `Miniconda3-latest-Linux-x86_64.sh`  using the following command 
